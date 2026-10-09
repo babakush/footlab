@@ -1,0 +1,506 @@
+-- FOOTLAB: script único para pegar en Supabase → SQL Editor (equivale a las migraciones de supabase/migrations)
+-- FOOTLAB · esquema inicial
+-- Tablas privadas protegidas con Row Level Security: cada usuario solo puede
+-- leer y modificar sus propios datos. La biblioteca de ejercicios es pública
+-- (solo ejercicios gratuitos) y los ejercicios Pro se filtran en la base de datos.
+
+create extension if not exists pgcrypto;
+
+-- ---------------------------------------------------------------------------
+-- Utilidades
+-- ---------------------------------------------------------------------------
+create or replace function public.set_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- profiles
+-- ---------------------------------------------------------------------------
+create table public.profiles (
+  id uuid primary key references auth.users (id) on delete cascade,
+  display_name text not null default '' check (char_length(display_name) <= 40),
+  -- Solo guardamos la edad (no la fecha de nacimiento) para minimizar datos.
+  age smallint check (age between 14 and 70),
+  onboarding_completed boolean not null default false,
+  privacy_accepted_at timestamptz,
+  -- Para menores (14-17): confirma que un tutor o entrenador está informado.
+  guardian_acknowledged boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create trigger profiles_updated_at before update on public.profiles
+  for each row execute function public.set_updated_at();
+
+-- Crea el perfil automáticamente al registrarse.
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  insert into public.profiles (id) values (new.id) on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- ---------------------------------------------------------------------------
+-- subscriptions (escrita solo desde el servidor mediante el webhook de Stripe)
+-- ---------------------------------------------------------------------------
+create table public.subscriptions (
+  user_id uuid primary key references public.profiles (id) on delete cascade,
+  stripe_customer_id text unique,
+  stripe_subscription_id text unique,
+  status text not null default 'inactive' check (
+    status in ('inactive', 'incomplete', 'incomplete_expired', 'trialing', 'active',
+               'past_due', 'canceled', 'unpaid', 'paused')
+  ),
+  price_id text,
+  current_period_end timestamptz,
+  cancel_at_period_end boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create trigger subscriptions_updated_at before update on public.subscriptions
+  for each row execute function public.set_updated_at();
+
+-- Fuente de verdad del plan Pro. No se expone a clientes con un uid arbitrario.
+create or replace function public.has_pro(uid uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1 from public.subscriptions s
+    where s.user_id = uid
+      and s.status in ('active', 'trialing')
+      and (s.current_period_end is null or s.current_period_end > now())
+  );
+$$;
+
+revoke execute on function public.has_pro(uuid) from public, anon, authenticated;
+
+-- Versión para el usuario actual (usada en políticas RLS y desde el servidor).
+create or replace function public.current_user_is_pro()
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select case when auth.uid() is null then false else public.has_pro(auth.uid()) end;
+$$;
+
+grant execute on function public.current_user_is_pro() to anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- player_preferences
+-- ---------------------------------------------------------------------------
+create table public.player_preferences (
+  user_id uuid primary key references public.profiles (id) on delete cascade,
+  position text not null check (position in ('portero', 'central', 'lateral', 'mediocentro', 'extremo', 'delantero')),
+  level text not null check (level in ('principiante', 'amateur', 'juvenil_competitivo', 'semiprofesional')),
+  goal text not null check (goal in ('velocidad', 'fuerza', 'resistencia', 'tecnica', 'agilidad', 'rendimiento_general')),
+  equipment text not null check (equipment in ('gimnasio', 'material_basico', 'sin_material')),
+  -- Días ISO: 1 = lunes ... 7 = domingo
+  available_days smallint[] not null default '{}' check (available_days <@ array[1,2,3,4,5,6,7]::smallint[]),
+  team_days smallint[] not null default '{}' check (team_days <@ array[1,2,3,4,5,6,7]::smallint[]),
+  match_day smallint check (match_day between 1 and 7),
+  -- Objetivos personalizados (Pro)
+  weekly_sessions_target smallint check (weekly_sessions_target between 1 and 14),
+  weekly_minutes_target smallint check (weekly_minutes_target between 30 and 1500),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create trigger player_preferences_updated_at before update on public.player_preferences
+  for each row execute function public.set_updated_at();
+
+-- Los objetivos personalizados son una función Pro: se verifica en la base de datos.
+create or replace function public.enforce_pro_targets()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if (new.weekly_sessions_target is not null or new.weekly_minutes_target is not null)
+     and (tg_op = 'INSERT'
+          or new.weekly_sessions_target is distinct from old.weekly_sessions_target
+          or new.weekly_minutes_target is distinct from old.weekly_minutes_target)
+     and not public.has_pro(new.user_id) then
+    raise exception 'PRO_REQUIRED' using errcode = 'P0001',
+      hint = 'Los objetivos personalizados forman parte del plan Pro.';
+  end if;
+  return new;
+end;
+$$;
+
+create trigger player_preferences_pro_targets
+  before insert or update on public.player_preferences
+  for each row execute function public.enforce_pro_targets();
+
+-- ---------------------------------------------------------------------------
+-- exercise_library (contenido público)
+-- ---------------------------------------------------------------------------
+create table public.exercise_library (
+  id uuid primary key default gen_random_uuid(),
+  slug text not null unique check (slug ~ '^[a-z0-9-]+$'),
+  name text not null,
+  category text not null check (category in ('aceleracion', 'fuerza_piernas', 'core', 'movilidad',
+                                             'coordinacion', 'tecnica', 'cambios_direccion', 'resistencia')),
+  goal text not null check (goal in ('velocidad', 'fuerza', 'resistencia', 'tecnica', 'agilidad', 'rendimiento_general')),
+  muscle_group text not null check (muscle_group in ('piernas', 'gluteos', 'isquiotibiales', 'cuadriceps',
+                                                     'gemelos', 'core', 'cadera', 'tren_superior', 'cuerpo_completo')),
+  exercise_type text not null check (exercise_type in ('fuerza', 'pliometria', 'sprint', 'movilidad',
+                                                       'tecnica', 'resistencia', 'estabilidad', 'coordinacion')),
+  equipment text not null check (equipment in ('sin_material', 'material_basico', 'gimnasio')),
+  equipment_detail text,
+  difficulty text not null check (difficulty in ('basico', 'intermedio', 'avanzado')),
+  duration_min smallint not null check (duration_min between 1 and 60),
+  summary text not null,
+  instructions text[] not null,
+  prescription text,
+  rest text,
+  common_mistakes text[] not null default '{}',
+  easier_variant text,
+  harder_variant text,
+  safety_notes text[] not null default '{}',
+  is_pro boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+create index exercise_library_category_idx on public.exercise_library (category);
+create index exercise_library_goal_idx on public.exercise_library (goal);
+
+-- Catálogo sin detalles: permite mostrar ejercicios Pro como bloqueados
+-- sin revelar su contenido a usuarios del plan gratuito.
+create or replace function public.exercise_catalog()
+returns table (
+  id uuid, slug text, name text, category text, goal text, muscle_group text, exercise_type text,
+  equipment text, difficulty text, duration_min smallint, summary text, is_pro boolean
+)
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select e.id, e.slug, e.name, e.category, e.goal, e.muscle_group, e.exercise_type,
+         e.equipment, e.difficulty, e.duration_min,
+         case when e.is_pro and not public.current_user_is_pro() then null else e.summary end,
+         e.is_pro
+  from public.exercise_library e
+  order by e.category, e.name;
+$$;
+
+grant execute on function public.exercise_catalog() to anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- training_sessions
+-- ---------------------------------------------------------------------------
+create table public.training_sessions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null default auth.uid() references public.profiles (id) on delete cascade,
+  session_date date not null,
+  session_type text not null check (session_type in ('fuerza', 'velocidad', 'agilidad', 'resistencia', 'tecnica',
+                                                     'movilidad', 'recuperacion', 'equipo', 'partido')),
+  title text not null check (char_length(title) between 1 and 80),
+  planned_minutes smallint check (planned_minutes between 5 and 300),
+  status text not null default 'pendiente' check (status in ('pendiente', 'completada', 'descansada')),
+  actual_minutes smallint check (actual_minutes between 1 and 400),
+  rpe smallint check (rpe between 1 and 10),
+  distance_km numeric(5, 2) check (distance_km > 0 and distance_km <= 100),
+  notes text check (char_length(notes) <= 1000),
+  source text not null default 'manual' check (source in ('manual', 'sugerida')),
+  completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint completed_requires_minutes check (status <> 'completada' or actual_minutes is not null)
+);
+
+create index training_sessions_user_date_idx on public.training_sessions (user_id, session_date);
+create index training_sessions_user_status_idx on public.training_sessions (user_id, status);
+
+create trigger training_sessions_updated_at before update on public.training_sessions
+  for each row execute function public.set_updated_at();
+
+-- Plan gratuito: máximo 5 sesiones personales por semana (los entrenamientos de
+-- equipo y los partidos no cuentan). Se comprueba en la base de datos.
+create or replace function public.enforce_free_weekly_limit()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  week_start date := date_trunc('week', new.session_date)::date;
+  existing int;
+begin
+  if new.session_type in ('equipo', 'partido') then
+    return new;
+  end if;
+  if tg_op = 'UPDATE' and new.session_date = old.session_date and new.session_type = old.session_type then
+    return new;
+  end if;
+  if public.has_pro(new.user_id) then
+    return new;
+  end if;
+  select count(*) into existing
+  from public.training_sessions t
+  where t.user_id = new.user_id
+    and t.session_date >= week_start
+    and t.session_date < week_start + 7
+    and t.session_type not in ('equipo', 'partido')
+    and t.id <> new.id;
+  if existing >= 5 then
+    raise exception 'FREE_PLAN_WEEKLY_LIMIT' using errcode = 'P0001',
+      hint = 'El plan gratuito permite 5 sesiones personales por semana.';
+  end if;
+  return new;
+end;
+$$;
+
+create trigger training_sessions_free_limit
+  before insert or update on public.training_sessions
+  for each row execute function public.enforce_free_weekly_limit();
+
+-- ---------------------------------------------------------------------------
+-- session_exercises
+-- ---------------------------------------------------------------------------
+create table public.session_exercises (
+  id uuid primary key default gen_random_uuid(),
+  session_id uuid not null references public.training_sessions (id) on delete cascade,
+  user_id uuid not null default auth.uid() references public.profiles (id) on delete cascade,
+  exercise_id uuid references public.exercise_library (id) on delete set null,
+  name text not null check (char_length(name) between 1 and 80),
+  prescription text check (char_length(prescription) <= 60),
+  position smallint not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create index session_exercises_session_idx on public.session_exercises (session_id, position);
+create index session_exercises_user_idx on public.session_exercises (user_id);
+
+-- ---------------------------------------------------------------------------
+-- daily_recovery_logs
+-- ---------------------------------------------------------------------------
+create table public.daily_recovery_logs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null default auth.uid() references public.profiles (id) on delete cascade,
+  log_date date not null,
+  sleep_hours numeric(3, 1) check (sleep_hours between 0 and 16),
+  sleep_quality smallint check (sleep_quality between 1 and 5),
+  energy smallint check (energy between 1 and 5),
+  muscle_fatigue smallint check (muscle_fatigue between 1 and 5),
+  motivation smallint check (motivation between 1 and 5),
+  hydration_liters numeric(3, 1) check (hydration_liters between 0 and 10),
+  significant_pain boolean not null default false,
+  dizziness boolean not null default false,
+  notes text check (char_length(notes) <= 500),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (user_id, log_date)
+);
+
+create trigger daily_recovery_logs_updated_at before update on public.daily_recovery_logs
+  for each row execute function public.set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- personal_records
+-- ---------------------------------------------------------------------------
+create table public.personal_records (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null default auth.uid() references public.profiles (id) on delete cascade,
+  label text not null check (char_length(label) between 1 and 60),
+  value numeric(10, 2) not null check (value >= 0),
+  unit text not null check (char_length(unit) between 1 and 15),
+  recorded_on date not null,
+  notes text check (char_length(notes) <= 300),
+  created_at timestamptz not null default now()
+);
+
+create index personal_records_user_idx on public.personal_records (user_id, recorded_on desc);
+
+-- ---------------------------------------------------------------------------
+-- Row Level Security
+-- ---------------------------------------------------------------------------
+alter table public.profiles enable row level security;
+alter table public.player_preferences enable row level security;
+alter table public.subscriptions enable row level security;
+alter table public.exercise_library enable row level security;
+alter table public.training_sessions enable row level security;
+alter table public.session_exercises enable row level security;
+alter table public.daily_recovery_logs enable row level security;
+alter table public.personal_records enable row level security;
+
+-- Los visitantes anónimos no tienen acceso a ninguna tabla privada.
+revoke all on public.profiles, public.player_preferences, public.subscriptions,
+  public.training_sessions, public.session_exercises, public.daily_recovery_logs,
+  public.personal_records from anon;
+
+-- Las suscripciones solo las escribe el servidor (service role).
+revoke insert, update, delete on public.subscriptions from authenticated;
+-- La biblioteca es de solo lectura para los clientes.
+revoke insert, update, delete on public.exercise_library from anon, authenticated;
+
+-- profiles
+create policy "profiles_select_own" on public.profiles
+  for select to authenticated using (id = (select auth.uid()));
+create policy "profiles_update_own" on public.profiles
+  for update to authenticated using (id = (select auth.uid())) with check (id = (select auth.uid()));
+
+-- player_preferences
+create policy "prefs_select_own" on public.player_preferences
+  for select to authenticated using (user_id = (select auth.uid()));
+create policy "prefs_insert_own" on public.player_preferences
+  for insert to authenticated with check (user_id = (select auth.uid()));
+create policy "prefs_update_own" on public.player_preferences
+  for update to authenticated using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+
+-- subscriptions: solo lectura propia
+create policy "subscriptions_select_own" on public.subscriptions
+  for select to authenticated using (user_id = (select auth.uid()));
+
+-- exercise_library: ejercicios gratuitos para todos; Pro solo con suscripción activa
+create policy "exercise_library_read" on public.exercise_library
+  for select to anon, authenticated using (not is_pro or public.current_user_is_pro());
+
+-- training_sessions
+create policy "sessions_select_own" on public.training_sessions
+  for select to authenticated using (user_id = (select auth.uid()));
+create policy "sessions_insert_own" on public.training_sessions
+  for insert to authenticated with check (user_id = (select auth.uid()));
+create policy "sessions_update_own" on public.training_sessions
+  for update to authenticated using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+create policy "sessions_delete_own" on public.training_sessions
+  for delete to authenticated using (user_id = (select auth.uid()));
+
+-- session_exercises: además, la sesión debe pertenecer al usuario
+create policy "session_exercises_select_own" on public.session_exercises
+  for select to authenticated using (user_id = (select auth.uid()));
+create policy "session_exercises_insert_own" on public.session_exercises
+  for insert to authenticated with check (
+    user_id = (select auth.uid())
+    and exists (select 1 from public.training_sessions t
+                where t.id = session_id and t.user_id = (select auth.uid()))
+  );
+create policy "session_exercises_update_own" on public.session_exercises
+  for update to authenticated using (user_id = (select auth.uid())) with check (
+    user_id = (select auth.uid())
+    and exists (select 1 from public.training_sessions t
+                where t.id = session_id and t.user_id = (select auth.uid()))
+  );
+create policy "session_exercises_delete_own" on public.session_exercises
+  for delete to authenticated using (user_id = (select auth.uid()));
+
+-- daily_recovery_logs
+create policy "recovery_select_own" on public.daily_recovery_logs
+  for select to authenticated using (user_id = (select auth.uid()));
+create policy "recovery_insert_own" on public.daily_recovery_logs
+  for insert to authenticated with check (user_id = (select auth.uid()));
+create policy "recovery_update_own" on public.daily_recovery_logs
+  for update to authenticated using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+create policy "recovery_delete_own" on public.daily_recovery_logs
+  for delete to authenticated using (user_id = (select auth.uid()));
+
+-- personal_records
+create policy "records_select_own" on public.personal_records
+  for select to authenticated using (user_id = (select auth.uid()));
+create policy "records_insert_own" on public.personal_records
+  for insert to authenticated with check (user_id = (select auth.uid()));
+create policy "records_update_own" on public.personal_records
+  for update to authenticated using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+create policy "records_delete_own" on public.personal_records
+  for delete to authenticated using (user_id = (select auth.uid()));
+
+-- ---------------------------------------------------------------------------
+-- Borrado de cuenta (derecho de supresión). Elimina el usuario de auth.users;
+-- todas las tablas privadas se borran en cascada.
+-- ---------------------------------------------------------------------------
+create or replace function public.delete_my_account()
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  uid uuid := auth.uid();
+begin
+  if uid is null then
+    raise exception 'NOT_AUTHENTICATED';
+  end if;
+  delete from auth.users where id = uid;
+end;
+$$;
+
+revoke execute on function public.delete_my_account() from public, anon;
+grant execute on function public.delete_my_account() to authenticated;
+
+-- Contenido inicial de la biblioteca de ejercicios (generado por scripts/build-exercise-seed.mjs)
+insert into public.exercise_library (slug, name, category, goal, muscle_group, exercise_type, equipment, equipment_detail, difficulty, duration_min, summary, instructions, prescription, rest, common_mistakes, easier_variant, harder_variant, safety_notes, is_pro) values
+  ('salidas-10m-desde-parado', 'Salidas de 10 m desde parado', 'aceleracion', 'velocidad', 'piernas', 'sprint', 'material_basico', '2 conos', 'basico', 12, 'Sprints cortos para trabajar los primeros apoyos y la reacción.', array['Coloca dos conos separados 10 m sobre una superficie firme y sin obstáculos.', 'Colócate en posición de salida a dos apoyos, con el peso ligeramente adelantado.', 'Arranca con decisión empujando el suelo hacia atrás y mantén el tronco inclinado los primeros pasos.', 'Recorre los 10 m a máxima intensidad controlada y desacelera de forma progresiva después del cono.', 'Vuelve caminando al inicio y descansa por completo antes de la siguiente repetición.']::text[], '2-3 series de 4 repeticiones', '60-90 s entre repeticiones, 2-3 min entre series', array['Levantar el tronco de golpe en el primer paso.', 'Dar zancadas demasiado largas al arrancar.', 'Acortar el descanso y convertir el ejercicio en trabajo de resistencia.']::text[], 'Salidas en ligera cuesta arriba a ritmo submáximo.', 'Salidas reactivas a una señal visual o sonora de un compañero.', array['Haz un calentamiento completo antes de esprintar.', 'Evítalo el día antes del partido si notas cargadas las piernas.']::text[], false),
+  ('marcha-a-skipping', 'Marcha A y skipping', 'aceleracion', 'velocidad', 'piernas', 'coordinacion', 'sin_material', null, 'basico', 8, 'Ejercicio técnico de carrera para mejorar la postura y el apoyo.', array['Marca un tramo de unos 15 m.', 'Camina elevando la rodilla hasta la altura de la cadera, con el pie flexionado hacia arriba.', 'Apoya debajo de la cadera, con la parte delantera del pie, y coordina el braceo contrario.', 'Cuando controles la marcha, pasa a skipping suave manteniendo la misma postura.']::text[], '3-4 pasadas de 15 m', 'Vuelta caminando', array['Inclinar el tronco hacia atrás.', 'Apoyar con el talón por delante del cuerpo.', 'Bracear cruzando por delante del pecho.']::text[], 'Solo marcha A, sin pasar a skipping.', 'Skipping con transición a sprint de 10 m.', array['Realízalo sobre una superficie regular.']::text[], false),
+  ('sprint-con-arrastre-ligero', 'Sprint con arrastre ligero', 'aceleracion', 'velocidad', 'piernas', 'sprint', 'gimnasio', 'Trineo o arnés de arrastre', 'avanzado', 15, 'Aceleraciones con resistencia ligera para reforzar la fase de empuje.', array['Ajusta un trineo o arnés con una carga ligera que no altere tu técnica de carrera.', 'Inclina el cuerpo hacia delante desde los tobillos y empuja el suelo con apoyos potentes.', 'Recorre 10-15 m manteniendo la postura y el ritmo de piernas.', 'Suelta el arnés y regresa caminando.']::text[], '4-6 repeticiones de 10-15 m', '2 min entre repeticiones', array['Usar demasiado peso y perder la mecánica de carrera.', 'Encorvar la espalda.', 'Pasos cortos y sin empuje.']::text[], 'Sprints en cuesta suave sin carga.', 'Arrastre ligero seguido de 10 m de sprint libre.', array['La carga debe permitir correr con buena técnica; si se deforma, redúcela.', 'Supervisión recomendada para menores.']::text[], true),
+  ('salidas-en-cuesta', 'Salidas en cuesta', 'aceleracion', 'velocidad', 'gluteos', 'sprint', 'sin_material', 'Una pendiente suave', 'intermedio', 15, 'La pendiente favorece una postura de aceleración y apoyos potentes.', array['Busca una cuesta suave y segura de al menos 20 m.', 'Arranca desde posición de dos apoyos y sube 15 m a intensidad alta.', 'Mantén el tronco inclinado y bracea con energía.', 'Baja caminando para recuperar.']::text[], '5-6 repeticiones de 15 m', 'Bajada caminando + 30 s', array['Elegir una cuesta demasiado pronunciada.', 'Mirar hacia los pies.', 'Bajar corriendo sin recuperar.']::text[], 'Subidas a ritmo de carrera progresiva.', 'Salidas en cuesta desde posición tumbado.', array['Evita superficies resbaladizas o con piedras sueltas.']::text[], true),
+  ('sentadilla-goblet', 'Sentadilla goblet', 'fuerza_piernas', 'fuerza', 'cuadriceps', 'fuerza', 'material_basico', 'Mancuerna o kettlebell', 'basico', 10, 'Sentadilla con el peso delante del pecho, ideal para aprender el patrón.', array['Sujeta una mancuerna o kettlebell pegada al pecho con ambas manos.', 'Separa los pies a la anchura de los hombros, con las puntas ligeramente hacia fuera.', 'Baja flexionando cadera y rodillas, manteniendo el pecho alto y los talones apoyados.', 'Desciende hasta donde mantengas la espalda neutra y sube empujando el suelo.']::text[], '3 series de 8-10 repeticiones', '90 s', array['Rodillas que se van hacia dentro.', 'Levantar los talones.', 'Redondear la zona lumbar al bajar.']::text[], 'Sentadilla a un banco sin peso.', 'Sentadilla goblet con pausa de 2 s abajo.', array['Elige un peso que te permita completar todas las repeticiones con buena técnica.', 'Detente si notas dolor en rodillas o espalda.']::text[], false),
+  ('zancada-atras', 'Zancada hacia atrás', 'fuerza_piernas', 'fuerza', 'piernas', 'fuerza', 'sin_material', null, 'basico', 10, 'Trabajo unilateral de piernas con menos impacto en la rodilla delantera.', array['De pie, con los pies a la anchura de la cadera.', 'Da un paso largo hacia atrás y baja la rodilla trasera hacia el suelo sin golpearlo.', 'Mantén el tronco estable y la rodilla delantera alineada con el pie.', 'Empuja con la pierna delantera para volver a la posición inicial.']::text[], '3 series de 8 por pierna', '60-90 s', array['Paso demasiado corto.', 'Inclinar el tronco en exceso.', 'Perder el equilibrio por apoyar los pies en línea.']::text[], 'Zancada estática apoyando una mano en la pared.', 'Zancada atrás con mancuernas.', array['Usa una superficie antideslizante.']::text[], false),
+  ('sentadilla-bulgara', 'Sentadilla búlgara', 'fuerza_piernas', 'fuerza', 'cuadriceps', 'fuerza', 'material_basico', 'Banco o silla estable', 'intermedio', 12, 'Sentadilla a una pierna con el pie trasero elevado.', array['Coloca el empeine de un pie sobre un banco detrás de ti.', 'Adelanta la otra pierna hasta que, al bajar, la rodilla quede sobre el pie.', 'Baja de forma controlada hasta que el muslo delantero quede casi paralelo al suelo.', 'Sube empujando con la pierna delantera, manteniendo el tronco estable.']::text[], '3 series de 6-8 por pierna', '90 s', array['Pie delantero demasiado cerca del banco.', 'Empujar con la pierna trasera.', 'Rodilla delantera hacia dentro.']::text[], 'Zancada estática con ambos pies en el suelo.', 'Sentadilla búlgara con mancuernas.', array['Comprueba que el banco no se desplaza.', 'Progresa la carga poco a poco.']::text[], false),
+  ('peso-muerto-rumano-una-pierna', 'Peso muerto rumano a una pierna', 'fuerza_piernas', 'fuerza', 'isquiotibiales', 'fuerza', 'material_basico', 'Mancuerna o kettlebell (opcional)', 'intermedio', 10, 'Fortalece isquiotibiales y glúteos y desafía el equilibrio.', array['De pie sobre una pierna, con la rodilla de apoyo ligeramente flexionada.', 'Inclina el tronco hacia delante desde la cadera mientras la pierna libre se extiende hacia atrás.', 'Mantén la espalda recta y la cadera nivelada.', 'Vuelve a la posición inicial apretando el glúteo de la pierna de apoyo.']::text[], '3 series de 8 por pierna', '60-90 s', array['Girar la cadera hacia fuera.', 'Redondear la espalda.', 'Bloquear la rodilla de apoyo.']::text[], 'Sin peso y apoyando la punta del pie libre.', 'Con mancuerna en la mano contraria a la pierna de apoyo.', array['Muévete lento y con control; prioriza la técnica sobre el peso.']::text[], false),
+  ('curl-nordico-asistido', 'Curl nórdico asistido', 'fuerza_piernas', 'fuerza', 'isquiotibiales', 'fuerza', 'material_basico', 'Compañero o anclaje para los tobillos, banda elástica', 'avanzado', 10, 'Trabajo excéntrico de isquiotibiales, muy usado en fútbol.', array['Arrodíllate sobre una superficie acolchada con los tobillos sujetos por un compañero o un anclaje.', 'Con el cuerpo recto de rodillas a cabeza, déjate caer hacia delante lo más lento posible.', 'Usa una banda elástica atada por delante o las manos para frenar el final del recorrido.', 'Vuelve a la posición inicial ayudándote con las manos.']::text[], '2-3 series de 4-6 repeticiones', '2 min', array['Doblar la cadera durante la bajada.', 'Caer sin control.', 'Aumentar el volumen demasiado rápido.']::text[], 'Recorrido parcial con más asistencia de la banda.', 'Mayor recorrido con menos asistencia.', array['Empieza con muy poco volumen: genera agujetas intensas al principio.', 'No lo hagas en los dos días previos a un partido.', 'Si hay molestias previas en isquiotibiales, consulta con un profesional.']::text[], true),
+  ('puente-gluteo-una-pierna', 'Puente de glúteo a una pierna', 'fuerza_piernas', 'fuerza', 'gluteos', 'fuerza', 'sin_material', null, 'basico', 8, 'Activa glúteos e isquiotibiales sin necesidad de material.', array['Túmbate boca arriba con una rodilla flexionada y la otra pierna extendida en el aire.', 'Empuja con el talón apoyado para elevar la cadera hasta alinear rodilla, cadera y hombros.', 'Mantén 1-2 s arriba sin arquear la zona lumbar.', 'Baja de forma controlada.']::text[], '3 series de 10 por pierna', '45-60 s', array['Arquear la espalda en lugar de extender la cadera.', 'Dejar caer la cadera del lado libre.']::text[], 'Puente con ambos pies apoyados.', 'Pie de apoyo elevado sobre un banco.', '{}'::text[], false),
+  ('saltos-al-cajon', 'Saltos al cajón', 'fuerza_piernas', 'velocidad', 'piernas', 'pliometria', 'gimnasio', 'Cajón pliométrico estable', 'intermedio', 10, 'Pliometría de baja exigencia de aterrizaje para desarrollar potencia.', array['Colócate frente a un cajón de altura moderada.', 'Flexiona ligeramente cadera y rodillas y lleva los brazos atrás.', 'Salta de forma explosiva y aterriza suave sobre el cajón con ambos pies.', 'Baja del cajón caminando, nunca saltando hacia atrás.']::text[], '3 series de 4-5 saltos', '90 s', array['Elegir un cajón demasiado alto.', 'Aterrizar con las rodillas hacia dentro.', 'Hacer muchas repeticiones con fatiga.']::text[], 'Saltos verticales en el sitio con aterrizaje controlado.', 'Salto al cajón desde media sentadilla con pausa.', array['Usa un cajón estable y antideslizante.', 'Calidad antes que cantidad: detente si el aterrizaje empeora.']::text[], true),
+  ('plancha-frontal', 'Plancha frontal', 'core', 'rendimiento_general', 'core', 'estabilidad', 'sin_material', null, 'basico', 6, 'Estabilidad del tronco para transmitir fuerza en carrera y choques.', array['Apoya antebrazos y puntas de los pies, con los codos bajo los hombros.', 'Alinea cabeza, espalda y cadera; aprieta glúteos y abdomen.', 'Respira de forma controlada y mantén la posición el tiempo indicado.']::text[], '3 series de 20-40 s', '45 s', array['Cadera demasiado alta o hundida.', 'Contener la respiración.', 'Mirar al frente forzando el cuello.']::text[], 'Plancha con rodillas apoyadas.', 'Plancha levantando alternativamente un pie.', array['Detén la serie cuando no puedas mantener la alineación.']::text[], false),
+  ('plancha-lateral', 'Plancha lateral', 'core', 'rendimiento_general', 'core', 'estabilidad', 'sin_material', null, 'basico', 6, 'Fortalece oblicuos y estabilizadores de la cadera.', array['Túmbate de lado apoyando el antebrazo bajo el hombro.', 'Eleva la cadera hasta formar una línea recta de cabeza a pies.', 'Mantén la posición sin dejar caer la cadera y cambia de lado.']::text[], '3 series de 20-30 s por lado', '30-45 s', array['Girar el tronco hacia el suelo.', 'Hundir la cadera.', 'Apoyar el codo lejos del hombro.']::text[], 'Con la rodilla inferior apoyada.', 'Elevando la pierna superior.', '{}'::text[], false),
+  ('dead-bug', 'Dead bug', 'core', 'rendimiento_general', 'core', 'estabilidad', 'sin_material', null, 'basico', 6, 'Control del abdomen mientras brazos y piernas se mueven.', array['Túmbate boca arriba con brazos hacia el techo y rodillas a 90°.', 'Pega la zona lumbar al suelo.', 'Extiende un brazo y la pierna contraria sin despegar la espalda.', 'Vuelve al centro y alterna.']::text[], '3 series de 8 por lado', '45 s', array['Arquear la espalda al extender.', 'Moverse demasiado rápido.']::text[], 'Mover solo las piernas.', 'Sujetando una banda elástica o un balón.', '{}'::text[], false),
+  ('pallof-press', 'Pallof press', 'core', 'rendimiento_general', 'core', 'estabilidad', 'material_basico', 'Banda elástica o polea', 'intermedio', 8, 'Ejercicio antirrotación para un tronco estable en giros y duelos.', array['Ata una banda a la altura del pecho y colócate de lado al anclaje.', 'Sujeta la banda con ambas manos pegadas al pecho.', 'Extiende los brazos al frente sin dejar que el tronco gire.', 'Mantén 2 s y vuelve al pecho.']::text[], '3 series de 10 por lado', '45 s', array['Girar el tronco hacia el anclaje.', 'Usar una banda demasiado dura.']::text[], 'De rodillas.', 'En posición de zancada o sobre una pierna.', array['Revisa que la banda esté bien anclada.']::text[], true),
+  ('copenhague-corto', 'Plancha de Copenhague (palanca corta)', 'core', 'rendimiento_general', 'cadera', 'estabilidad', 'material_basico', 'Banco', 'intermedio', 8, 'Fortalece aductores y estabilidad lateral, importantes en el fútbol.', array['Túmbate de lado con el antebrazo apoyado y la rodilla de la pierna superior sobre un banco.', 'Eleva la cadera hasta alinear el cuerpo, apoyándote en la rodilla del banco.', 'Mantén la posición sin dejar caer la cadera.']::text[], '2-3 series de 15-25 s por lado', '45-60 s', array['Hundir la cadera.', 'Empezar con palanca larga (pie en el banco) sin base.']::text[], 'Plancha lateral con rodilla apoyada en el suelo.', 'Palanca larga con el pie sobre el banco.', array['Progresa despacio; detente si sientes dolor en la ingle.']::text[], true),
+  ('movilidad-cadera-90-90', 'Movilidad de cadera 90/90', 'movilidad', 'rendimiento_general', 'cadera', 'movilidad', 'sin_material', null, 'basico', 6, 'Mejora la rotación interna y externa de la cadera.', array['Siéntate con ambas rodillas flexionadas a 90°, una delante y otra al lado.', 'Mantén el tronco erguido y gira las rodillas hacia el lado contrario sin usar las manos si puedes.', 'Alterna de lado de forma lenta y controlada.']::text[], '2 series de 8 cambios', 'Sin descanso específico', array['Encorvar la espalda.', 'Forzar el rango con rebotes.']::text[], 'Apoyando las manos detrás.', 'Con pausa e inclinación del tronco sobre la rodilla delantera.', array['Muévete dentro de un rango cómodo, sin dolor.']::text[], false),
+  ('estiramiento-flexor-cadera', 'Movilidad de flexores de cadera en zancada', 'movilidad', 'rendimiento_general', 'cadera', 'movilidad', 'sin_material', null, 'basico', 5, 'Libera la parte delantera de la cadera, muy cargada en futbolistas.', array['Colócate en posición de caballero con una rodilla en el suelo.', 'Aprieta el glúteo de la pierna trasera y lleva la cadera ligeramente hacia delante.', 'Eleva el brazo del mismo lado y mantén 30 s respirando con calma.']::text[], '2 x 30 s por lado', '—', array['Arquear la zona lumbar.', 'Llevar la rodilla delantera muy por delante del pie.']::text[], 'Con una almohadilla bajo la rodilla y sin elevar el brazo.', 'Añadiendo una ligera inclinación lateral del tronco.', array['Protege la rodilla apoyada con una superficie blanda.']::text[], false),
+  ('movilidad-tobillo-pared', 'Movilidad de tobillo en la pared', 'movilidad', 'agilidad', 'gemelos', 'movilidad', 'sin_material', 'Una pared', 'basico', 5, 'Mejora la flexión del tobillo, útil en aceleraciones y sentadillas.', array['Colócate frente a una pared con un pie adelantado a unos centímetros.', 'Lleva la rodilla hacia la pared sin despegar el talón.', 'Vuelve atrás y repite de forma controlada.']::text[], '2 series de 10 por lado', '—', array['Levantar el talón.', 'Dejar que la rodilla se vaya hacia dentro.']::text[], 'Pie más cerca de la pared.', 'Pie más lejos de la pared con pausa al final.', '{}'::text[], false),
+  ('rutina-movilidad-pre-partido', 'Rutina de movilidad dinámica (10 min)', 'movilidad', 'rendimiento_general', 'cuerpo_completo', 'movilidad', 'sin_material', null, 'basico', 10, 'Secuencia suave para el día previo al partido o como activación.', array['Balanceos de pierna frontales y laterales: 10 por pierna.', 'Aperturas de cadera caminando: 10 m.', 'Zancada con rotación de tronco: 5 por lado.', 'Gusanos (inchworm) con paso corto: 5 repeticiones.', 'Movilidad de tobillo y skipping suave: 2 pasadas de 15 m.']::text[], '1 vuelta continua', 'Lo que necesites', array['Hacerlo con prisa.', 'Forzar rangos con rebotes.']::text[], 'Reducir a la mitad las repeticiones.', 'Añadir 2 aceleraciones suaves al final.', array['Debe sentirse ligero: no es un entrenamiento intenso.']::text[], true),
+  ('escalera-dentro-fuera', 'Escalera de coordinación: dentro-fuera', 'coordinacion', 'agilidad', 'gemelos', 'coordinacion', 'material_basico', 'Escalera de agilidad o líneas en el suelo', 'basico', 8, 'Mejora la frecuencia de apoyos y la coordinación de pies.', array['Colócate al lado de la escalera.', 'Entra con un pie y luego con el otro en el primer hueco, y sal de la misma forma.', 'Avanza hueco a hueco manteniendo apoyos cortos sobre la parte delantera del pie.', 'Prioriza la precisión antes que la velocidad.']::text[], '4-6 pasadas', 'Vuelta caminando', array['Mirar siempre los pies.', 'Pisar los travesaños.', 'Bracear poco.']::text[], 'Un pie en cada hueco, a ritmo lento.', 'Terminar con un sprint de 5 m.', '{}'::text[], false),
+  ('saltos-a-una-pierna-en-linea', 'Saltos laterales sobre una línea', 'coordinacion', 'agilidad', 'gemelos', 'pliometria', 'sin_material', null, 'intermedio', 6, 'Rigidez de tobillo y control en el aterrizaje.', array['Coloca una línea en el suelo y ponte a un lado.', 'Salta de un lado a otro con ambos pies, con contactos cortos.', 'Cuando lo domines, hazlo con una sola pierna.']::text[], '3 series de 15-20 s', '45 s', array['Aterrizar sobre los talones.', 'Rodillas rígidas.']::text[], 'Saltos con ambos pies a ritmo lento.', 'Saltos a una pierna en zigzag.', array['Detente si notas molestias en el tendón de Aquiles.']::text[], true),
+  ('pases-contra-pared', 'Pases contra la pared a dos toques', 'tecnica', 'tecnica', 'piernas', 'tecnica', 'material_basico', 'Balón y una pared', 'basico', 10, 'Control orientado y pase con ambas piernas.', array['Colócate a 4-6 m de una pared con el balón.', 'Pasa con el interior del pie, controla el rebote orientándolo y vuelve a pasar.', 'Alterna pierna derecha e izquierda en cada bloque.', 'Aumenta la distancia cuando el control sea limpio.']::text[], '4 bloques de 1 min por pierna', '30 s', array['Controlar con el cuerpo rígido.', 'Usar solo la pierna dominante.', 'Mirar solo el balón.']::text[], 'Controlar parando el balón por completo antes de pasar.', 'Pase a un toque alternando piernas.', array['Asegúrate de que el entorno es seguro para golpear el balón.']::text[], false),
+  ('conduccion-entre-conos', 'Conducción en slalom', 'tecnica', 'tecnica', 'piernas', 'tecnica', 'material_basico', 'Balón y 6 conos', 'basico', 10, 'Conducción cercana con cambios de ritmo y ambas piernas.', array['Coloca 6 conos en línea separados 1,5 m.', 'Conduce en zigzag con toques cortos usando interior y exterior.', 'Al terminar, acelera 5 m con el balón y vuelve conduciendo.']::text[], '6-8 pasadas', '30-45 s', array['Toques demasiado largos.', 'Cabeza siempre abajo.']::text[], 'Conos más separados.', 'Solo con la pierna no dominante.', '{}'::text[], false),
+  ('golpeo-con-ambas-piernas', 'Golpeo a portería con ambas piernas', 'tecnica', 'tecnica', 'piernas', 'tecnica', 'material_basico', 'Balones y portería o diana', 'intermedio', 15, 'Precisión en el golpeo tras conducción.', array['Coloca el balón a 16-20 m de la portería.', 'Conduce 2-3 toques y golpea buscando una zona concreta.', 'Alterna piernas en cada repetición y registra cuántos aciertos haces.']::text[], '3 series de 6 golpeos', '60 s', array['Inclinar el tronco hacia atrás.', 'Pie de apoyo mal orientado.']::text[], 'Golpeo con balón parado.', 'Golpeo tras pared con un compañero.', array['Limita el número de golpeos para evitar sobrecarga del aductor y del cuádriceps.']::text[], true),
+  ('control-orientado-aereo', 'Control de balones aéreos', 'tecnica', 'tecnica', 'piernas', 'tecnica', 'material_basico', 'Balón', 'intermedio', 10, 'Amortiguación con pie, muslo y pecho.', array['Lanza el balón hacia arriba a una altura moderada.', 'Amortigua con la superficie elegida (pie, muslo o pecho) y deja el balón a tus pies.', 'Orienta el control hacia un lado tras dominarlo.']::text[], '3 bloques de 2 min', '45 s', array['Superficie de contacto rígida.', 'No mover los pies para ajustar la posición.']::text[], 'Lanzamientos más bajos con las manos.', 'Balones enviados por un compañero desde 10 m.', '{}'::text[], true),
+  ('test-5-10-5', 'Lanzadera 5-10-5', 'cambios_direccion', 'agilidad', 'piernas', 'sprint', 'material_basico', '3 conos', 'intermedio', 12, 'Desaceleración y reaceleración lateral.', array['Coloca tres conos en línea separados 5 m.', 'Desde el cono central, corre 5 m a un lado, toca la línea, corre 10 m al lado contrario y vuelve 5 m al centro.', 'Baja el centro de gravedad al frenar y empuja con la pierna exterior.']::text[], '4-6 repeticiones', '90 s', array['Frenar con el tronco erguido.', 'Dar demasiados pasos antes del cambio.']::text[], 'A ritmo controlado, sin tocar el suelo con la mano.', 'Salida reactiva a una señal.', array['Usa calzado con buen agarre.', 'Evítalo con molestias en rodillas o tobillos.']::text[], false),
+  ('frenadas-controladas', 'Frenadas en 3 apoyos', 'cambios_direccion', 'agilidad', 'cuadriceps', 'coordinacion', 'sin_material', null, 'basico', 8, 'Aprende a desacelerar de forma segura antes de cambiar de dirección.', array['Corre 10 m a ritmo medio.', 'Frena en tres apoyos cortos, bajando la cadera y con el tronco ligeramente adelantado.', 'Mantén la posición estable un segundo.']::text[], '3 series de 4 frenadas', '60 s', array['Frenar en un solo apoyo brusco.', 'Rodillas hacia dentro.']::text[], 'Desde trote suave.', 'Frenada y salida lateral inmediata.', '{}'::text[], false),
+  ('giros-180-con-balon', 'Giros de 180° con salida', 'cambios_direccion', 'agilidad', 'piernas', 'sprint', 'material_basico', '2 conos', 'avanzado', 12, 'Cambios de sentido completos como en una presión o repliegue.', array['Sprint de 5 m hasta el cono.', 'Gira 180° con apoyos cortos y vuelve 10 m a máxima intensidad controlada.', 'Alterna el lado del giro en cada repetición.']::text[], '2 series de 5 repeticiones', '60 s / 3 min entre series', array['Giro amplio y lento.', 'Perder la postura baja.']::text[], 'Giro a 90° a ritmo submáximo.', 'Con balón y conducción de salida.', array['No lo programes el día antes del partido.']::text[], true),
+  ('carrera-continua-suave', 'Carrera continua suave', 'resistencia', 'resistencia', 'cuerpo_completo', 'resistencia', 'sin_material', null, 'basico', 25, 'Base aeróbica a ritmo conversacional.', array['Corre a un ritmo que te permita mantener una conversación.', 'Mantén una postura relajada y una zancada cómoda.', 'Termina con 5 min caminando y movilidad suave.']::text[], '20-30 min', '—', array['Correr demasiado rápido.', 'Aumentar la duración bruscamente de una semana a otra.']::text[], 'Alternar 4 min de carrera y 1 min caminando.', 'Añadir 4 progresivos de 15 s al final.', array['Hidrátate y adapta el ritmo al calor.']::text[], false),
+  ('intervalos-15-15', 'Intervalos 15/15', 'resistencia', 'resistencia', 'cuerpo_completo', 'resistencia', 'material_basico', 'Conos para marcar distancias', 'intermedio', 20, 'Esfuerzos intermitentes similares a las exigencias del partido.', array['Calienta 10 min.', 'Corre 15 s a ritmo alto (no máximo) y recupera 15 s trotando o caminando.', 'Completa el bloque manteniendo un ritmo similar en todas las repeticiones.']::text[], '2 bloques de 6 min', '3 min entre bloques', array['Salir demasiado rápido en las primeras repeticiones.', 'No calentar.']::text[], '2 bloques de 4 min.', '3 bloques de 6 min.', array['No lo programes los dos días previos al partido.', 'Detente si notas mareo o dolor en el pecho y consulta con un profesional sanitario.']::text[], false),
+  ('rondos-cardio-con-balon', 'Circuito aeróbico con balón', 'resistencia', 'resistencia', 'cuerpo_completo', 'resistencia', 'material_basico', 'Balón y conos', 'intermedio', 20, 'Trabajo de resistencia integrando conducción y pases.', array['Monta un circuito de 40-60 m con conducción, pared y sprint corto.', 'Recorre el circuito de forma continua a ritmo moderado.', 'Cambia el sentido en cada vuelta para usar ambas piernas.']::text[], '3 bloques de 4 min', '2 min', array['Descuidar la técnica por la fatiga.']::text[], 'Bloques de 3 min.', 'Añadir un cambio de ritmo de 10 m en cada vuelta.', '{}'::text[], true),
+  ('bici-o-eliptica-recuperacion', 'Cardio suave de recuperación', 'resistencia', 'rendimiento_general', 'cuerpo_completo', 'resistencia', 'gimnasio', 'Bicicleta estática o elíptica (o caminar)', 'basico', 20, 'Actividad de baja intensidad para el día después del partido.', array['Pedalea o usa la elíptica a una intensidad muy cómoda.', 'Mantén una respiración tranquila durante todo el trabajo.', 'Termina con 5 min de movilidad suave.']::text[], '15-25 min', '—', array['Convertirlo en un entrenamiento intenso.']::text[], 'Paseo de 20 min.', 'Natación suave de 20 min.', array['Si tienes molestias tras el partido, prioriza el descanso y consulta si persisten.']::text[], false)
+on conflict (slug) do update set
+  name = excluded.name,
+  category = excluded.category,
+  goal = excluded.goal,
+  muscle_group = excluded.muscle_group,
+  exercise_type = excluded.exercise_type,
+  equipment = excluded.equipment,
+  equipment_detail = excluded.equipment_detail,
+  difficulty = excluded.difficulty,
+  duration_min = excluded.duration_min,
+  summary = excluded.summary,
+  instructions = excluded.instructions,
+  prescription = excluded.prescription,
+  rest = excluded.rest,
+  common_mistakes = excluded.common_mistakes,
+  easier_variant = excluded.easier_variant,
+  harder_variant = excluded.harder_variant,
+  safety_notes = excluded.safety_notes,
+  is_pro = excluded.is_pro;
