@@ -13,6 +13,7 @@ import { insertSuggestedSessions } from "@/lib/sessions";
 import { EQUIPMENT, GOALS, LEVELS, POSITIONS } from "@/lib/constants";
 import type { ActionResult } from "@/lib/types";
 import { getStripe, isStripeConfigured } from "@/lib/stripe";
+import { createAdminClient } from "@/lib/supabase/admin";
 
 type FieldResult = ActionResult & { fieldErrors?: Record<string, string> };
 
@@ -307,7 +308,7 @@ export async function updateTargets(input: unknown): Promise<FieldResult> {
 
 export async function deleteAccount(confirmation: string): Promise<ActionResult> {
   if (confirmation.trim().toUpperCase() !== "ELIMINAR") return { ok: false, error: "Escribe ELIMINAR para confirmar." };
-  const { supabase, subscription } = await getAccount();
+  const { supabase, user, subscription } = await getAccount();
 
   // Si hay una suscripción activa en Stripe, se cancela antes de borrar los datos.
   const activeStatuses = ["active", "trialing", "past_due", "unpaid", "incomplete", "paused"];
@@ -325,8 +326,15 @@ export async function deleteAccount(confirmation: string): Promise<ActionResult>
     }
   }
 
-  const { error } = await supabase.rpc("delete_my_account");
-  if (error) return { ok: false, error: "No se ha podido eliminar la cuenta. Inténtalo de nuevo." };
+  const { error: rpcError } = await supabase.rpc("delete_my_account");
+  let failed = !!rpcError;
+  // Alternativa en servidor si la función no existe en la base de datos:
+  // borra el usuario verificado con la API de administración (los datos se borran en cascada).
+  if (failed && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    const { error } = await createAdminClient().auth.admin.deleteUser(user.id);
+    failed = !!error;
+  }
+  if (failed) return { ok: false, error: "No se ha podido eliminar la cuenta. Inténtalo de nuevo." };
   await supabase.auth.signOut();
   redirect("/?cuenta=eliminada");
 }
