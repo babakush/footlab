@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: #0a0b0d;
+  --foreground: #f4f5f6;
+  --card: #111316;
+  --card-foreground: #f4f5f6;
+  --elevated: #171a1e;
+  --muted: #1a1d21;
+  --muted-foreground: #8b929b;
+  --border: #22262c;
+  --input: #2a2f36;
+  --ring: #c6f432;
+  --primary: #c6f432;
+  --primary-foreground: #0a0b0d;
+  --secondary: #1d2025;
+  --secondary-foreground: #e9ebee;
+  --accent: #c6f432;
+  --destructive: #f2555a;
+  --warning: #f5b544;
+  --success: #c6f432;
+  --info: #6cb6ff;
+  --radius: 0.875rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-elevated: var(--elevated);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-accent: var(--accent);
+  --color-destructive: var(--destructive);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+  --color-info: var(--info);
+  --radius-sm: calc(var(--radius) - 6px);
+  --radius-md: calc(var(--radius) - 4px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  --animate-fade-up: fade-up 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@layer base {
+  * { border-color: var(--border); }
+  html { color-scheme: dark; -webkit-tap-highlight-color: transparent; }
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-feature-settings: "ss01", "cv11";
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: color-mix(in oklab, var(--primary) 35%, transparent); }
+  :focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.8); }
+}
+
+@utility tabular { font-variant-numeric: tabular-nums; }
+
+@utility bg-grid {
+  background-image:
+    linear-gradient(to right, color-mix(in oklab, var(--foreground) 5%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in oklab, var(--foreground) 5%, transparent) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
