@@ -17,6 +17,8 @@ export function missingSupabaseVars(): string[] {
 }
 
 export function siteUrl() {
-  const url = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000";
+  // En Vercel, si no se define NEXT_PUBLIC_SITE_URL, se usa el dominio de producción del proyecto.
+  const vercelUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL;
+  const url = process.env.NEXT_PUBLIC_SITE_URL || (vercelUrl ? `https://${vercelUrl}` : "http://localhost:3000");
   return url.replace(/\/$/, "");
 }
